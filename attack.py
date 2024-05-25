@@ -10,7 +10,6 @@ import numpy as np
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 diffusion_pipeline = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1")
-discriminator = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1")
 processor = AutoProcessor.from_pretrained("openai/clip-vit-large-patch14")
 safety_checker = diffusion_pipeline.safety_checker
 
