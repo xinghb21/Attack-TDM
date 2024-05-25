@@ -8,7 +8,7 @@ from timm import create_model
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-diffusion_model = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v-1-4")
+diffusion_model = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1")
 
 # Define robust discriminator
 class RobustDiscriminator(nn.Module):
