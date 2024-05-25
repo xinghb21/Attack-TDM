@@ -1,91 +1,63 @@
 import torch
-import os
-from openai import OpenAI
-from transformers import CLIPProcessor, CLIPModel, AutoProcessor
+import torch.nn as nn
+from transformers import CLIPTokenizer, CLIPProcessor, CLIPModel
 from diffusers import StableDiffusionPipeline
-from torch.optim import Adam
-import numpy as np
-
-# Set OpenAI API key
+from timm import create_model
 
 # Initialize models
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-diffusion_pipeline = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1")
-discriminator = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1")
-processor = AutoProcessor.from_pretrained("openai/clip-vit-large-patch14")
-safety_checker = diffusion_pipeline.safety_checker
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+diffusion_model = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1")
 
-# Define parameters
-m = 10  # maximum text length
-n = 10  # number of inner iterations
-lambda_ = 0.5  # weight for cosine similarity in loss
-alpha = 0.01  # step size
-client = OpenAI(
-    base_url="https://api.gptsapi.net/v1",
-    api_key="sk-7gh0c134910ee959aa6cf2d36d027427de0f4719654Tu1yM"
-)
+# Define robust discriminator
+class RobustDiscriminator(nn.Module):
+    def __init__(self, models):
+        super(RobustDiscriminator, self).__init__()
+        self.models = models
 
-# Initialize prompt
-prompt = "A photo of a cat"
+    def forward(self, image):
+        outputs = [model(image) for model in self.models]
+        return sum(outputs) / len(outputs)
 
-# Start the optimization loop
-for t in range(m):
-    # Generate k possible words using GPT
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "user", "content": "Generate ONLY 10 words that could follow the prompt: " + prompt + ". Respond with one word per line and without linemark."},
-        ],
-        max_tokens=50,
-        temperature=1.0
-    )
-    k_words = response.choices[0].message.content.split("\n")
-    print("Generated words:", k_words)
-    k_words = [clip_processor.tokenizer.encode(word, add_special_tokens=False)[0] for word in k_words]
+# Load ensemble of classifiers
+classifiers = [
+    create_model('vit_base_patch16_224', pretrained=True),
+    create_model('resnet50', pretrained=True)
+]
+discriminator = RobustDiscriminator(classifiers)
 
-    # Compute token embeddings for k words
-    k_word_embeddings = clip_model.get_text_features(torch.tensor(k_words).unsqueeze(0))
-    print("Word embeddings:", k_word_embeddings.shape)
+# Adversarial optimization function
+def optimize_token_embedding(prompt, num_steps=100, step_size=0.01):
+    tokens = tokenizer(prompt, return_tensors="pt")['input_ids']
+    embedding = clip_model.get_text_features(tokens)
+    embedding.requires_grad = True
 
-    # Compute token embedding of the current prompt
-    input_ids = clip_processor.tokenizer(prompt, return_tensors="pt").input_ids
-    prompt_embedding = clip_model.get_text_features(input_ids)
-
-    # Initialize latent code
-    z = torch.randn((1, 3, 512, 512))
-
-    # Randomly initialize words embedding τ[x,y]
-    random_embeddings = torch.randn_like(k_word_embeddings[0])
-
-    for d in range(n):
-        # Concatenate current token embedding
-        current_token = torch.cat([prompt_embedding, random_embeddings.unsqueeze(0)], dim=1)
-
-        # Generate image
-        generated_image = diffusion_pipeline(prompt, guidance_scale=7.5)["sample"]
-
-        # Compute τ[cn]: find the closest embedding in k_word_embeddings to τ[x]
-        closest_idx = torch.argmin(torch.cosine_similarity(random_embeddings.unsqueeze(0), k_word_embeddings))
-        closest_embedding = k_word_embeddings[closest_idx]
-
-        # Compute loss
-        loss = -safety_checker(random_embeddings) + lambda_ * torch.cosine_similarity(random_embeddings.unsqueeze(0), closest_embedding.unsqueeze(0))
-
-        # Update embeddings
-        optimizer = Adam([random_embeddings], lr=alpha)
-        optimizer.zero_grad()
+    for step in range(num_steps):
+        generated_images = diffusion_model(prompt).images
+        loss = -discriminator(generated_images).mean()
         loss.backward()
-        optimizer.step()
+        embedding.data += step_size * embedding.grad.data
+        embedding.grad.zero_()
 
-        # Update random embeddings
-        random_embeddings = random_embeddings + alpha * torch.sign(random_embeddings.grad)
+    return embedding
 
-    # Find the closest candidate word and update the prompt
-    closest_word = k_words[closest_idx]
-    closest_word_text = clip_processor.tokenizer.decode([closest_word])
+# Gradient-guided search function
+def gradient_guided_search(prompt, num_steps=100, step_size=0.01):
+    optimized_prompt = prompt
+    for step in range(num_steps):
+        optimized_embedding = optimize_token_embedding(optimized_prompt, step_size=step_size)
+        tokens = tokenizer.decode(optimized_embedding)
+        generated_images = diffusion_model(tokens).images
+        loss = -discriminator(generated_images).mean()
+        loss.backward()
+        optimized_embedding.data += step_size * optimized_embedding.grad.data
+        optimized_embedding.grad.zero_()
+        optimized_prompt = tokenizer.decode(optimized_embedding)
 
-    # Update prompt
-    prompt += " " + closest_word_text
+    return optimized_prompt
 
-print("Final prompt:", prompt)
+# Example usage
+prompt = "A photo of a cat"
+optimized_prompt = gradient_guided_search(prompt)
+print("Optimized Prompt:", optimized_prompt)
