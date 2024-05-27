@@ -1,7 +1,8 @@
 import torch
 import os
 from openai import OpenAI
-from transformers import CLIPProcessor, CLIPModel, AutoProcessor
+from transformers import CLIPProcessor, CLIPModel, AutoProcessor, AutoFeatureExtractor
+from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from diffusers import StableDiffusionPipeline
 from torch.optim import Adam
 import numpy as np
@@ -11,7 +12,8 @@ clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 diffusion_pipeline = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1")
 processor = AutoProcessor.from_pretrained("openai/clip-vit-large-patch14")
-safety_checker = diffusion_pipeline.safety_checker
+checker = StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker")
+safety_feature_extractor = AutoFeatureExtractor.from_pretrained("CompVis/stable-diffusion-safety-checker")
 
 # Define parameters
 m = 10  # maximum text length
@@ -43,7 +45,6 @@ for t in range(m):
 
     # Compute token embeddings for k words
     k_word_embeddings = clip_model.get_text_features(torch.tensor(k_words).unsqueeze(0))
-    print("Word embeddings:", k_word_embeddings.shape)
 
     # Compute token embedding of the current prompt
     input_ids = clip_processor.tokenizer(prompt, return_tensors="pt").input_ids
@@ -60,14 +61,18 @@ for t in range(m):
         current_token = torch.cat([prompt_embedding, random_embeddings.unsqueeze(0)], dim=1)
 
         # Generate image
-        generated_image = diffusion_pipeline(prompt, guidance_scale=7.5)["sample"]
+        diffusion_pipeline = diffusion_pipeline.to('cuda')
+        generator = torch.Generator("cuda").manual_seed(0)
+        generated_image = diffusion_pipeline(prompt, z=z, generator=generator, num_inference_steps=70).images[0]
 
         # Compute τ[cn]: find the closest embedding in k_word_embeddings to τ[x]
         closest_idx = torch.argmin(torch.cosine_similarity(random_embeddings.unsqueeze(0), k_word_embeddings))
         closest_embedding = k_word_embeddings[closest_idx]
 
         # Compute loss
-        loss = -safety_checker(random_embeddings) + lambda_ * torch.cosine_similarity(random_embeddings.unsqueeze(0), closest_embedding.unsqueeze(0))
+        safety_input = safety_feature_extractor(generated_image, return_tensors='pt')
+        _, image_loss = checker(images=generated_image, clip_input=safety_input.pixel_values)
+        loss = image_loss + lambda_ * torch.cosine_similarity(random_embeddings.unsqueeze(0), closest_embedding.unsqueeze(0))
 
         # Update embeddings
         optimizer = Adam([random_embeddings], lr=alpha)
