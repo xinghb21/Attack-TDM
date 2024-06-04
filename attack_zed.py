@@ -8,6 +8,7 @@ import torchvision.transforms as transforms
 import numpy as np
 import random
 from transformers.models.clip.image_processing_clip import CLIPImageProcessor
+import os
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -23,10 +24,12 @@ diffusion_pipeline = StableDiffusionPipeline.from_pretrained(diff_dir).to(device
 checker = StableDiffusionSafetyChecker.from_pretrained(checker_dir)
 safety_feature_extractor = AutoFeatureExtractor.from_pretrained(checker_dir)
 
+tokenizer = diffusion_pipeline.tokenizer
+
 # Define parameters
 m = 10  # maximum text length
-n = 10  # number of inner iterations
-lambda_ = 0.5  # weight for cosine similarity in loss
+n = 20  # number of inner iterations
+lambda_ = 0.1  # weight for cosine similarity in loss
 alpha = 0.01  # step size
 r = random.random()  # random number'
 
@@ -44,16 +47,30 @@ def get_text_embedding(inputs):
     proj_emb = clip_model.text_projection(pooled_output)
     return proj_emb
 
-cos = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
-loss_fn = lambda x, y: 1 - cos(x.view(-1), y.view(-1))
+def choose_k_words(k):
+    # Generate k possible words using GPT
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "user", "content": "Generate ONLY " + str(k) +  "words that could follow the prompt: " + prompt + """. Respond with one word per line and WITHOUT linemark and period.\\
+            The words should be related to the prompt and make sense in the context of the prompt."""},
+        ],
+        max_tokens=3 * k,
+        temperature=1.0
+    )
+    k_words = response.choices[0].message.content.split("\n")
+    return k_words
 
-image = Image.open(f'OIP.jpg')
-inputs = preprocess(images=[image], return_tensors="pt").to(device)
-image_embeds = clip_model.get_image_features(**inputs).detach()
-print("Image embeddings:", image_embeds.shape)
-text_embeds = get_text_embedding("A photo of a cat").detach()
-loss = loss_fn(image_embeds, text_embeds)
-print(loss)
+cos = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
+loss_fn = lambda x, y: cos(x.view(-1), y.view(-1))
+
+# image = Image.open(f'OIP.jpg')
+# inputs = preprocess(images=[image], return_tensors="pt").to(device)
+# image_embeds = clip_model.get_image_features(**inputs).detach()
+# print("Image embeddings:", image_embeds.shape)
+# text_embeds = get_text_embedding("A photo of a cat").detach()
+# loss = loss_fn(image_embeds, text_embeds)
+# print(loss)
 
 client = OpenAI(
     base_url="https://api.gptsapi.net/v1",
@@ -67,22 +84,33 @@ prompt_embeds = get_text_embedding(prompt).detach()
 # Start the optimization loop
 for t in range(m):
     # Generate k possible words using GPT
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "user", "content": "Generate ONLY 10 words that could follow the prompt: " + prompt + ". Respond with one word per line and without linemark."},
-        ],
-        max_tokens=50,
-        temperature=1.0
-    )
-    k_words = response.choices[0].message.content.split("\n")
-    print("Generated words:", k_words)
+    word_cnt = 10
 
-    # diffusion_pipeline = diffusion_pipeline.to('cpu')
+    while True:
 
-    # Compute token embeddings for k words
-    k_word_embeddings = [diffusion_pipeline.encode_prompt(word, device, 1, True)[0].to(device) for word in k_words]
-    print("Encoded words:", k_word_embeddings[0].shape)
+        k_words = choose_k_words(word_cnt)
+
+        text_model = diffusion_pipeline.text_encoder.text_model
+
+        # Compute token embeddings for k words
+        k_word_ids = [tokenizer(
+            word, max_length=tokenizer.model_max_length,
+            truncation=True, return_tensors='pt', add_special_tokens=False).input_ids.to(device)[0] for word in k_words]
+        refined_ids = []
+        for x in k_word_ids:
+            if len(x) == 1:
+                refined_ids.append(x)
+        if len(refined_ids) >= 10:
+            break
+        elif word_cnt < 200:
+            word_cnt += 10
+        else:
+            break
+
+    k_word_ids = refined_ids[:10]
+    print([tokenizer.decode(k_word_ids[i]) for i in range(len(k_word_ids))])
+    k_word_embeddings = [text_model.embeddings.token_embedding(ids).detach().unsqueeze(0) for ids in k_word_ids]
+    print("Encoded words:", [k_word_embeddings[i].shape for i in range(len(k_word_embeddings))])
 
     # Compute token embedding of the current prompt
     prompt_embedding = diffusion_pipeline.encode_prompt(prompt, device, 1, True)[0].to(device)
@@ -91,15 +119,32 @@ for t in range(m):
     # Initialize latent code
     z = torch.randn(1, 4, 64, 64).to(device)
 
+    input_ids = tokenizer(
+        prompt, padding='max_length', max_length=tokenizer.model_max_length,
+        truncation=True, return_tensors='pt').input_ids.to(device)[0]
+    for idx in range(input_ids.shape[0]):
+        if input_ids[idx] == tokenizer.eos_token_id:
+            pos_eos = idx
+            break
+    input_ids[pos_eos + 2] = tokenizer.eos_token_id
+    slice_adv = range(pos_eos, pos_eos + 2)
+    # input_embed = text_model.embeddings.token_embedding(input_ids).detach().unsqueeze(0)
+    input_embed = diffusion_pipeline.text_encoder(input_ids.unsqueeze(0))[0]
+    print("input_embed: ", input_embed.shape)
+    print(slice_adv)
+
     # Randomly initialize words embedding τ[x,y]
-    random_embeddings = torch.randn_like(k_word_embeddings[0]).to(device).detach()
+    # random_embeddings = torch.randn_like(k_word_embeddings[0]).to(device).detach()
+    random_embeddings = torch.randn(1, 2, 1024).to(device).detach()
     random_embeddings.requires_grad = True
 
-    optim = torch.optim.Adam([random_embeddings], lr=1e-5)
+    optim = torch.optim.Adam([random_embeddings], lr=0.1)
 
     for d in range(n):
         # Concatenate current token embedding
-        current_token = prompt_embedding
+        # current_token = prompt_embedding
+        # current_token = input_embed
+        current_token = torch.cat([input_embed[:, :pos_eos, :], random_embeddings, input_embed[:, pos_eos + 2:, :]], dim=1)
         print("Current token:", current_token.shape)
 
         # Generate image
@@ -107,22 +152,27 @@ for t in range(m):
         generator = torch.Generator(device).manual_seed(0)
         generated_image = diffusion_pipeline(prompt_embeds=current_token, z=z, generator=generator, num_inference_steps=70).images[0]
         inputs = preprocess(images=[generated_image], return_tensors="pt").to(device)
-        generated_image.save(f'generated_image_{t}_{d}.png')
+        os.makedirs(f'./figures/{t}', exist_ok=True)
+        generated_image.save(f'./figures/{t}/{d}.png', )
+
+        first_word = random_embeddings[:, 0, :]
 
         # Compute τ[cn]: find the closest embedding in k_word_embeddings to τ[x]
-        distance = torch.Tensor([torch.cosine_similarity(random_embeddings.reshape(-1), k_word_embedding.reshape(-1), dim=0) for k_word_embedding in k_word_embeddings])
+        distance = torch.Tensor([1 - loss_fn(first_word.reshape(-1), k_word_embedding.reshape(-1)) for k_word_embedding in k_word_embeddings])
         closest_idx = torch.argmin(distance)
         closest_embedding = k_word_embeddings[closest_idx]
 
         # Compute loss
         image_embeds = clip_model.get_image_features(**inputs).detach()
         image_loss = loss_fn(image_embeds, prompt_embeds)
-        loss = image_loss + lambda_ * torch.cosine_similarity(random_embeddings.reshape(-1), closest_embedding.reshape(-1), dim=0)
+        print("FUCK",image_loss.item())
+        loss = image_loss + lambda_ * (1 - loss_fn(first_word.reshape(-1), closest_embedding.reshape(-1)))
 
         # Update embeddings
         loss = loss.to(device)
+        print("Loss:", loss.item())
         optim.zero_grad()
-        loss.backward()
+        loss.backward(retain_graph=True)
         optim.step()
         # grad = random_embeddings.grad
         # random_embeddings = random_embeddings.clone().detach()
@@ -130,6 +180,7 @@ for t in range(m):
 
     # Find the closest candidate word and update the prompt
     closest_word = k_words[closest_idx]
+    print(closest_word)
 
     # Update prompt
     prompt += " " + closest_word
