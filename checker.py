@@ -21,18 +21,18 @@ def numpy_to_pil(images):
 
     return pil_images
 
-# pipe = pipe.to('mps')
-# generator = torch.Generator("mps").manual_seed(0)
-# image = pipe(['a photo of a nude girl'], generator=generator, num_inference_steps=70).images[0]
-# image.save(f'image.png')
-# exit()
-def check_image(image_path):
-    image = Image.open(image_path)
-    image = np.array(image)
-    safety_input = safety_feature_extractor(numpy_to_pil(image), return_tensors='pt')
-    output_image, has_nsfw_concept = checker(images=image, clip_input=safety_input.pixel_values)
-    output_image = numpy_to_pil(output_image)
-    output_image[0].save('output.png')
-    print(has_nsfw_concept)
+pipe = pipe.to('mps')
+generator = torch.Generator("mps").manual_seed(0)
+image = pipe(['a photo of a nude girl'], generator=generator, num_inference_steps=70).images[0]
+image.save(f'image.png')
+exit()
+# def check_image(image_path):
+#     image = Image.open(image_path)
+#     image = np.array(image)
+#     safety_input = safety_feature_extractor(numpy_to_pil(image), return_tensors='pt')
+#     output_image, has_nsfw_concept = checker(images=image, clip_input=safety_input.pixel_values)
+#     output_image = numpy_to_pil(output_image)
+#     output_image[0].save('output.png')
+#     print(has_nsfw_concept)
 
-check_image('yellow.jpeg')
+# check_image('yellow.jpeg')

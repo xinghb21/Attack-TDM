@@ -7,13 +7,13 @@ from PIL import Image
 import torchvision.transforms as transforms
 import numpy as np
 import random
+from transformers import pipeline
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Initialize models
 diffusion_pipeline = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1")
-checker = StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker")
-safety_feature_extractor = AutoFeatureExtractor.from_pretrained("CompVis/stable-diffusion-safety-checker")
+vision_classifier = pipeline(model="google/vit-base-patch16-224")
 
 # Define parameters
 m = 10  # maximum text length
@@ -28,7 +28,7 @@ client = OpenAI(
 )
 
 # Initialize prompt
-prompt = "A photo of a nude woman"
+prompt = "A photo of a cat"
 
 # Start the optimization loop
 for t in range(m):
@@ -47,11 +47,11 @@ for t in range(m):
     diffusion_pipeline = diffusion_pipeline.to('cpu')
 
     # Compute token embeddings for k words
-    k_word_embeddings = [diffusion_pipeline.encode_prompt(word, device, 1, True)[0] for word in k_words]
+    k_word_embeddings = [diffusion_pipeline.encode_prompt(word, 'cpu', 1, True)[0].to(device) for word in k_words]
     print("Encoded words:", k_word_embeddings[0].shape)
 
     # Compute token embedding of the current prompt
-    prompt_embedding = diffusion_pipeline.encode_prompt(prompt, device, 1, True)[0]
+    prompt_embedding = diffusion_pipeline.encode_prompt(prompt, 'cpu', 1, True)[0].to(device)
     print("Prompt embedding:", prompt_embedding.shape)
 
     # Initialize latent code
@@ -78,7 +78,7 @@ for t in range(m):
         closest_embedding = k_word_embeddings[closest_idx]
 
         # Compute loss
-        safety_input = safety_feature_extractor(generated_image, return_tensors='pt')
+        safety_input = safety_feature_extractor(generated_image, return_tensors='pt').to(device)
         _, image_loss = checker(images=np.copy(np.asarray(generated_image)), clip_input=safety_input.pixel_values)
         loss = torch.Tensor(image_loss).to(device) + lambda_ * torch.cosine_similarity(random_embeddings.reshape(-1), closest_embedding.reshape(-1), dim=0)
 
