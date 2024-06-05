@@ -15,6 +15,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 clip_dir = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
 clip_model = CLIPModel.from_pretrained(clip_dir, torch_dtype=torch.float16).to(device)
 preprocess = CLIPProcessor.from_pretrained(clip_dir, torch_dtype=torch.float16)
+print(preprocess.feature_extractor.__class__)
 # tokenizer_clip = CLIPTokenizer.from_pretrained(clip_dir)
 
 # Initialize models
@@ -194,9 +195,11 @@ for t in range(m):
         generated_image = diffusion_pipeline(prompt_embeds=current_token, z=z, generator=generator, num_inference_steps=1, output_type="pt").images[0]
         # del current_token
         inputs = preprocess(images=generated_image, text=[init_prompt], return_tensors="pt", padding=True).to(device)
-        del generated_image
+        print(inputs.pixel_values.shape)
+        print(generated_image.shape)
+        # del generated_image
         os.makedirs(f'./figures/{t}', exist_ok=True)
-        # generated_image.save(f'./figures/{t}/{d}.png')
+        generated_image.save(f'./figures/{t}/{d}.png')
 
         first_word = random_embeddings[:, 0, :]
 
