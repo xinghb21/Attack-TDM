@@ -13,16 +13,16 @@ import os
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 clip_dir = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
-clip_model = CLIPModel.from_pretrained(clip_dir).to(device)
-preprocess = CLIPProcessor.from_pretrained(clip_dir)
-tokenizer = CLIPTokenizer.from_pretrained(clip_dir)
+clip_model = CLIPModel.from_pretrained(clip_dir, torch_dtype=torch.float16).to(device)
+preprocess = CLIPProcessor.from_pretrained(clip_dir, torch_dtype=torch.float16)
+# tokenizer_clip = CLIPTokenizer.from_pretrained(clip_dir)
 
 # Initialize models
 diff_dir = "/data1/zhaoed/models/stable-diffusion-2-1/models--stabilityai--stable-diffusion-2-1/snapshots/5cae40e6a2745ae2b01ad92ae5043f95f23644d6"
 checker_dir = "/data1/zhaoed/models/stable-diffusion-safety-checker/models--CompVis--stable-diffusion-safety-checker/snapshots/cb41f3a270d63d454d385fc2e4f571c487c253c5"
-diffusion_pipeline = StableDiffusionPipeline.from_pretrained(diff_dir).to(device)
-checker = StableDiffusionSafetyChecker.from_pretrained(checker_dir)
-safety_feature_extractor = AutoFeatureExtractor.from_pretrained(checker_dir)
+diffusion_pipeline = StableDiffusionPipeline.from_pretrained(diff_dir, revision="fp16", torch_dtype=torch.float16).to(device)
+# checker = StableDiffusionSafetyChecker.from_pretrained(checker_dir)
+# safety_feature_extractor = AutoFeatureExtractor.from_pretrained(checker_dir)
 
 tokenizer = diffusion_pipeline.tokenizer
 
@@ -111,6 +111,7 @@ client = OpenAI(
 # Initialize prompt
 target_class = "cat"
 prompt = f"A photo of a {target_class}"
+init_prompt = prompt
 prompt_embeds = get_text_embedding(prompt).detach()
 target_token = tokenizer.encoder[target_class + '</w>']
 
@@ -180,7 +181,8 @@ for t in range(m):
     optim = torch.optim.Adam([random_embeddings], lr=0.1)
 
     for d in range(n):
-        random_embeddings.requires_grad = True
+        torch.cuda.empty_cache()
+        random_embeddings = random_embeddings.detach().requires_grad_(True)
         # Concatenate current token embedding
         # current_token = prompt_embedding
         # current_token = input_embed
@@ -188,32 +190,42 @@ for t in range(m):
         print("Current token:", current_token.shape)
 
         # Generate image
-        diffusion_pipeline = diffusion_pipeline.to(device)
         generator = torch.Generator(device).manual_seed(0)
-        generated_image = diffusion_pipeline(prompt_embeds=current_token, z=z, generator=generator, num_inference_steps=70).images[0]
-        inputs = preprocess(images=[generated_image], return_tensors="pt").to(device)
+        generated_image = diffusion_pipeline(prompt_embeds=current_token, z=z, generator=generator, num_inference_steps=1, output_type="pt").images[0]
+        # del current_token
+        inputs = preprocess(images=generated_image, text=[init_prompt], return_tensors="pt", padding=True).to(device)
+        del generated_image
         os.makedirs(f'./figures/{t}', exist_ok=True)
-        generated_image.save(f'./figures/{t}/{d}.png', )
+        # generated_image.save(f'./figures/{t}/{d}.png')
 
         first_word = random_embeddings[:, 0, :]
 
         # Compute τ[cn]: find the closest embedding in k_word_embeddings to τ[x]
         distance = torch.Tensor([1 - loss_fn(first_word.reshape(-1), k_word_embedding.reshape(-1)) for k_word_embedding in k_word_embeddings])
+        # del first_word
         closest_idx = torch.argmin(distance)
         closest_embedding = k_word_embeddings[closest_idx]
 
         # Compute loss
-        image_embeds = clip_model.get_image_features(**inputs).detach()
-        image_loss = loss_fn(image_embeds, prompt_embeds)
+        # image_embeds = clip_model.get_image_features(**inputs).detach()
+        # image_loss = loss_fn(image_embeds, prompt_embeds)
+
+        outputs = clip_model(**inputs)
+        # del inputs
+        logits_per_image = outputs.logits_per_image
+        # probs = logits_per_image.softmax(dim=1)
+        image_loss = logits_per_image[0]
         print("FUCK",image_loss.item())
-        loss = image_loss + lambda_ * (1 - loss_fn(first_word.reshape(-1), closest_embedding.reshape(-1)))
+        loss = lambda_ * image_loss
 
         # Update embeddings
         loss = loss.to(device)
         print("Loss:", loss.item())
         optim.zero_grad()
-        loss.backward(retain_graph=True)
-        # print(random_embeddings.grad)
+        print(loss.grad_fn)
+        print(random_embeddings.requires_grad)
+        loss.backward()
+        print(random_embeddings.grad)
         optim.step()
         # grad = random_embeddings.grad
         # random_embeddings = random_embeddings.clone().detach()
