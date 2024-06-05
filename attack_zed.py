@@ -30,7 +30,7 @@ tokenizer = diffusion_pipeline.tokenizer
 m = 10  # maximum text length
 n = 20  # number of inner iterations
 lambda_ = 0.1  # weight for cosine similarity in loss
-alpha = 0.01  # step size
+alpha = 5e-2  # step size
 r = random.random()  # random number'
 
 def get_text_embedding(inputs):
@@ -61,6 +61,37 @@ def choose_k_words(k):
     k_words = response.choices[0].message.content.split("\n")
     return k_words
 
+def get_ascii_toks(tokenizer, embed_weights, device, target_token):
+
+    def is_ascii(s):
+        return s.isascii() and s.isprintable()
+
+    ascii_toks = []
+    for i in range(3, tokenizer.vocab_size):
+        if is_ascii(tokenizer.decoder[i]) and tokenizer.decoder[i].endswith('</w>'):
+            if tokenizer.decoder[i][:-4].isalpha() == False:
+                continue
+            s1 = tokenizer.decode([i])
+            s2 = tokenizer.decode(tokenizer.encode(s1), skip_special_tokens=True)
+            if s1 == s2:
+                ascii_toks.append(i)
+    forbidden_tokens = []
+    # remove the top-k most similar tokens
+    weights_concept = embed_weights[target_token]
+    cos = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
+    cosine_values = []
+    for idx in ascii_toks:
+        weights_idx = embed_weights[idx]
+        cosine_values.append(cos(weights_concept, weights_idx))
+    cosine_values = torch.tensor(cosine_values, device=device)
+    _, topk = torch.topk(cosine_values, k=20, largest=True)
+    # print('Following words are not allowed:')
+    for idx in topk:
+        forbidden_tokens.append(tokenizer.decode([ascii_toks[idx]]))
+        # print(tokenizer.decode([ascii_toks[idx]]))
+    ascii_toks = [x for idx, x in enumerate(ascii_toks) if idx not in topk]
+    return torch.tensor(ascii_toks, device=device), forbidden_tokens
+
 cos = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
 loss_fn = lambda x, y: cos(x.view(-1), y.view(-1))
 
@@ -78,39 +109,47 @@ client = OpenAI(
 )
 
 # Initialize prompt
-prompt = "A photo of a cat"
+target_class = "cat"
+prompt = f"A photo of a {target_class}"
 prompt_embeds = get_text_embedding(prompt).detach()
+target_token = tokenizer.encoder[target_class + '</w>']
 
+embed_weights = diffusion_pipeline.text_encoder.get_input_embeddings().weight.data
+k_word_ids, _ = get_ascii_toks(tokenizer, embed_weights, device, target_token)
+print(k_word_ids)
+text_model = diffusion_pipeline.text_encoder.text_model
 # Start the optimization loop
 for t in range(m):
+    k_word_ids = torch.randperm(k_word_ids.shape[0], device=device)[:100]
     # Generate k possible words using GPT
-    word_cnt = 10
+    # word_cnt = 10
 
-    while True:
+    # while True:
 
-        k_words = choose_k_words(word_cnt)
+    #     k_words = choose_k_words(word_cnt)
 
-        text_model = diffusion_pipeline.text_encoder.text_model
+    #     text_model = diffusion_pipeline.text_encoder.text_model
 
-        # Compute token embeddings for k words
-        k_word_ids = [tokenizer(
-            word, max_length=tokenizer.model_max_length,
-            truncation=True, return_tensors='pt', add_special_tokens=False).input_ids.to(device)[0] for word in k_words]
-        refined_ids = []
-        for x in k_word_ids:
-            if len(x) == 1:
-                refined_ids.append(x)
-        if len(refined_ids) >= 10:
-            break
-        elif word_cnt < 200:
-            word_cnt += 10
-        else:
-            break
+    #     # Compute token embeddings for k words
+    #     k_word_ids = [tokenizer(
+    #         word, max_length=tokenizer.model_max_length,
+    #         truncation=True, return_tensors='pt', add_special_tokens=False).input_ids.to(device)[0] for word in k_words]
+    #     refined_ids = []
+    #     for x in k_word_ids:
+    #         if len(x) == 1:
+    #             refined_ids.append(x)
+    #     if len(refined_ids) >= 10:
+    #         break
+    #     elif word_cnt < 200:
+    #         word_cnt += 10
+    #     else:
+    #         break
 
-    k_word_ids = refined_ids[:10]
-    print([tokenizer.decode(k_word_ids[i]) for i in range(len(k_word_ids))])
+    # k_word_ids = refined_ids[:10]
+    # print([tokenizer.decode(k_word_ids[i]) for i in range(len(k_word_ids))])
+    k_words = [tokenizer.decode(k_word_ids[i]) for i in range(len(k_word_ids))]
     k_word_embeddings = [text_model.embeddings.token_embedding(ids).detach().unsqueeze(0) for ids in k_word_ids]
-    print("Encoded words:", [k_word_embeddings[i].shape for i in range(len(k_word_embeddings))])
+    # print("Encoded words:", [k_word_embeddings[i].shape for i in range(len(k_word_embeddings))])
 
     # Compute token embedding of the current prompt
     prompt_embedding = diffusion_pipeline.encode_prompt(prompt, device, 1, True)[0].to(device)
@@ -141,6 +180,7 @@ for t in range(m):
     optim = torch.optim.Adam([random_embeddings], lr=0.1)
 
     for d in range(n):
+        random_embeddings.requires_grad = True
         # Concatenate current token embedding
         # current_token = prompt_embedding
         # current_token = input_embed
@@ -173,10 +213,13 @@ for t in range(m):
         print("Loss:", loss.item())
         optim.zero_grad()
         loss.backward(retain_graph=True)
+        # print(random_embeddings.grad)
         optim.step()
         # grad = random_embeddings.grad
         # random_embeddings = random_embeddings.clone().detach()
-        # random_embeddings = random_embeddings + r * alpha * torch.sign(grad)
+        # tmp = random_embeddings.clone().detach()
+        # tmp += r * alpha * torch.sign(random_embeddings.grad)
+        # random_embeddings = tmp
 
     # Find the closest candidate word and update the prompt
     closest_word = k_words[closest_idx]
