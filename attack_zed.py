@@ -21,6 +21,7 @@ parser.add_argument('--gpt', action='store_true')
 args = parser.parse_args()
 target_class = args.target_class
 use_gpt = args.gpt
+kwords_method = 'gpt' if use_gpt else 'tokenizer'
 
 # Initialize CLIP model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -198,8 +199,8 @@ for t in range(m):
         generator = torch.Generator(device).manual_seed(0)
         generated_image = diffusion_pipeline(prompt_embeds=current_token, z=z, generator=generator, num_inference_steps=70).images[0]
         inputs = preprocess(images=[generated_image], return_tensors="pt").to(device)
-        os.makedirs(f'./figures/{t}', exist_ok=True)
-        generated_image.save(f'./figures/{t}/{d}.png')
+        os.makedirs(f'./figures/{kwords_method}/{target_class}/{t}', exist_ok=True)
+        generated_image.save(f'./figures/{kwords_method}/{target_class}/{t}/{d}.png')
 
         # Extract first word embedding τ[x]
         first_word = random_embeddings[:, 0, :]
