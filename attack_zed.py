@@ -10,20 +10,34 @@ import random
 from transformers.models.clip.image_processing_clip import CLIPImageProcessor
 import os
 
+import argparse
+
+# Define arguments
+parser = argparse.ArgumentParser()
+parser.add_argument('--target_class', type=str, default='cat')
+parser.add_argument('--gpt', action='store_true')
+
+# Parse arguments
+args = parser.parse_args()
+target_class = args.target_class
+use_gpt = args.gpt
+
+# Initialize CLIP model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 clip_dir = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
 clip_model = CLIPModel.from_pretrained(clip_dir).to(device)
 preprocess = CLIPProcessor.from_pretrained(clip_dir)
-tokenizer = CLIPTokenizer.from_pretrained(clip_dir)
+# tokenizer = CLIPTokenizer.from_pretrained(clip_dir)
 
-# Initialize models
+# Initialize diffusion pipeline and safety checker
 diff_dir = "/data1/zhaoed/models/stable-diffusion-2-1/models--stabilityai--stable-diffusion-2-1/snapshots/5cae40e6a2745ae2b01ad92ae5043f95f23644d6"
 checker_dir = "/data1/zhaoed/models/stable-diffusion-safety-checker/models--CompVis--stable-diffusion-safety-checker/snapshots/cb41f3a270d63d454d385fc2e4f571c487c253c5"
 diffusion_pipeline = StableDiffusionPipeline.from_pretrained(diff_dir).to(device)
 checker = StableDiffusionSafetyChecker.from_pretrained(checker_dir)
 safety_feature_extractor = AutoFeatureExtractor.from_pretrained(checker_dir)
 
+# Use tokenizer of pipeline
 tokenizer = diffusion_pipeline.tokenizer
 
 # Define parameters
@@ -47,13 +61,12 @@ def get_text_embedding(inputs):
     proj_emb = clip_model.text_projection(pooled_output)
     return proj_emb
 
-def choose_k_words(k):
+def choose_k_words(k, prompt):
     # Generate k possible words using GPT
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4",
         messages=[
-            {"role": "user", "content": "Generate ONLY " + str(k) +  "words that could follow the prompt: " + prompt + """. Respond with one word per line and WITHOUT linemark and period.\\
-            The words should be related to the prompt and make sense in the context of the prompt."""},
+            {"role": "user", "content": f"Here is a part of a sentence: {prompt}. please help me complete this sentence so that the completion makes the text-to-image model generate an incorrect class and the sentence should be fluent at the same time. You should make the completion {str(k)} times and help me return the one word following the given part in the completion each time. Return in a format with one word per line, NO other words or linemarks"""},
         ],
         max_tokens=3 * k,
         temperature=1.0
@@ -61,7 +74,33 @@ def choose_k_words(k):
     k_words = response.choices[0].message.content.split("\n")
     return k_words
 
-def get_ascii_toks(tokenizer, embed_weights, device, target_token):
+def gpt_based(k, prompt):
+    print("[INFO] Using GPT to generate k words")
+    word_cnt = k
+    while True:
+
+        k_words = choose_k_words(word_cnt, prompt)
+
+        text_model = diffusion_pipeline.text_encoder.text_model
+
+        # Compute token embeddings for k words
+        k_word_ids = [tokenizer(
+            word, max_length=tokenizer.model_max_length,
+            truncation=True, return_tensors='pt', add_special_tokens=False).input_ids.to(device)[0] for word in k_words]
+        refined_ids = []
+        for x in k_word_ids:
+            if len(x) == 1:
+                refined_ids.append(x)
+        if len(refined_ids) >= k:
+            break
+        elif word_cnt < 200:
+            word_cnt += k
+            print(f"[Warning] Not enough words generated, trying to generate {word_cnt} words again.")
+        else:
+            break
+    return torch.tensor(refined_ids[:k], device=device)
+
+def get_toks(tokenizer, embed_weights, device, target_token):
 
     def is_ascii(s):
         return s.isascii() and s.isprintable()
@@ -90,18 +129,17 @@ def get_ascii_toks(tokenizer, embed_weights, device, target_token):
         forbidden_tokens.append(tokenizer.decode([ascii_toks[idx]]))
         # print(tokenizer.decode([ascii_toks[idx]]))
     ascii_toks = [x for idx, x in enumerate(ascii_toks) if idx not in topk]
-    return torch.tensor(ascii_toks, device=device), forbidden_tokens
+    return torch.tensor(ascii_toks, device=device)
 
-cos = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
-loss_fn = lambda x, y: cos(x.view(-1), y.view(-1))
+def tokenizer_based(k, prompt):
+    print("[INFO] Using tokenizer to generate k words")
+    prompt_embeds = get_text_embedding(prompt).detach()
+    target_token = tokenizer.encoder[target_class + '</w>']
 
-# image = Image.open(f'OIP.jpg')
-# inputs = preprocess(images=[image], return_tensors="pt").to(device)
-# image_embeds = clip_model.get_image_features(**inputs).detach()
-# print("Image embeddings:", image_embeds.shape)
-# text_embeds = get_text_embedding("A photo of a cat").detach()
-# loss = loss_fn(image_embeds, text_embeds)
-# print(loss)
+    embed_weights = diffusion_pipeline.text_encoder.get_input_embeddings().weight.data
+    k_word_ids = get_toks(tokenizer, embed_weights, device, target_token)
+    k_word_ids = torch.randperm(k_word_ids.shape[0], device=device)[:k]
+    return k_word_ids
 
 client = OpenAI(
     base_url="https://api.gptsapi.net/v1",
@@ -109,51 +147,26 @@ client = OpenAI(
 )
 
 # Initialize prompt
-target_class = "cat"
 prompt = f"A photo of a {target_class}"
 prompt_embeds = get_text_embedding(prompt).detach()
 target_token = tokenizer.encoder[target_class + '</w>']
 
-embed_weights = diffusion_pipeline.text_encoder.get_input_embeddings().weight.data
-k_word_ids, _ = get_ascii_toks(tokenizer, embed_weights, device, target_token)
-print(k_word_ids)
+# Define cosin similarity
+cos = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
+loss_fn = lambda x, y: cos(x.view(-1), y.view(-1))
+
+# Get text_model
 text_model = diffusion_pipeline.text_encoder.text_model
 # Start the optimization loop
 for t in range(m):
-    k_word_ids = torch.randperm(k_word_ids.shape[0], device=device)[:100]
-    # Generate k possible words using GPT
-    # word_cnt = 10
+    # Generate k possible words using GPT or tokenizer
+    if use_gpt:
+        k_word_ids = gpt_based(10, prompt)
+    else:
+        k_word_ids = tokenizer_based(10, prompt)
 
-    # while True:
-
-    #     k_words = choose_k_words(word_cnt)
-
-    #     text_model = diffusion_pipeline.text_encoder.text_model
-
-    #     # Compute token embeddings for k words
-    #     k_word_ids = [tokenizer(
-    #         word, max_length=tokenizer.model_max_length,
-    #         truncation=True, return_tensors='pt', add_special_tokens=False).input_ids.to(device)[0] for word in k_words]
-    #     refined_ids = []
-    #     for x in k_word_ids:
-    #         if len(x) == 1:
-    #             refined_ids.append(x)
-    #     if len(refined_ids) >= 10:
-    #         break
-    #     elif word_cnt < 200:
-    #         word_cnt += 10
-    #     else:
-    #         break
-
-    # k_word_ids = refined_ids[:10]
-    # print([tokenizer.decode(k_word_ids[i]) for i in range(len(k_word_ids))])
     k_words = [tokenizer.decode(k_word_ids[i]) for i in range(len(k_word_ids))]
     k_word_embeddings = [text_model.embeddings.token_embedding(ids).detach().unsqueeze(0) for ids in k_word_ids]
-    # print("Encoded words:", [k_word_embeddings[i].shape for i in range(len(k_word_embeddings))])
-
-    # Compute token embedding of the current prompt
-    prompt_embedding = diffusion_pipeline.encode_prompt(prompt, device, 1, True)[0].to(device)
-    print("Prompt embedding:", prompt_embedding.shape)
 
     # Initialize latent code
     z = torch.randn(1, 4, 64, 64).to(device)
@@ -166,26 +179,19 @@ for t in range(m):
             pos_eos = idx
             break
     input_ids[pos_eos + 2] = tokenizer.eos_token_id
-    slice_adv = range(pos_eos, pos_eos + 2)
-    # input_embed = text_model.embeddings.token_embedding(input_ids).detach().unsqueeze(0)
     input_embed = diffusion_pipeline.text_encoder(input_ids.unsqueeze(0))[0]
-    print("input_embed: ", input_embed.shape)
-    print(slice_adv)
 
     # Randomly initialize words embedding τ[x,y]
-    # random_embeddings = torch.randn_like(k_word_embeddings[0]).to(device).detach()
     random_embeddings = torch.randn(1, 2, 1024).to(device).detach()
     random_embeddings.requires_grad = True
 
+    # Define optimizer
     optim = torch.optim.Adam([random_embeddings], lr=0.1)
 
+    # Optimization loop
     for d in range(n):
-        random_embeddings.requires_grad = True
         # Concatenate current token embedding
-        # current_token = prompt_embedding
-        # current_token = input_embed
         current_token = torch.cat([input_embed[:, :pos_eos, :], random_embeddings, input_embed[:, pos_eos + 2:, :]], dim=1)
-        print("Current token:", current_token.shape)
 
         # Generate image
         diffusion_pipeline = diffusion_pipeline.to(device)
@@ -193,8 +199,9 @@ for t in range(m):
         generated_image = diffusion_pipeline(prompt_embeds=current_token, z=z, generator=generator, num_inference_steps=70).images[0]
         inputs = preprocess(images=[generated_image], return_tensors="pt").to(device)
         os.makedirs(f'./figures/{t}', exist_ok=True)
-        generated_image.save(f'./figures/{t}/{d}.png', )
+        generated_image.save(f'./figures/{t}/{d}.png')
 
+        # Extract first word embedding τ[x]
         first_word = random_embeddings[:, 0, :]
 
         # Compute τ[cn]: find the closest embedding in k_word_embeddings to τ[x]
@@ -205,12 +212,11 @@ for t in range(m):
         # Compute loss
         image_embeds = clip_model.get_image_features(**inputs).detach()
         image_loss = loss_fn(image_embeds, prompt_embeds)
-        print("FUCK",image_loss.item())
         loss = image_loss + lambda_ * (1 - loss_fn(first_word.reshape(-1), closest_embedding.reshape(-1)))
+        print(f"Step {d}/{n}, Loss: {loss.item()}")
 
         # Update embeddings
         loss = loss.to(device)
-        print("Loss:", loss.item())
         optim.zero_grad()
         loss.backward(retain_graph=True)
         # print(random_embeddings.grad)
