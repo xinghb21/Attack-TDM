@@ -1,13 +1,9 @@
 import torch
 from openai import OpenAI
-from transformers import AutoFeatureExtractor, CLIPProcessor, CLIPModel, CLIPTokenizer
+from transformers import AutoFeatureExtractor, CLIPProcessor, CLIPModel
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from diffusers import StableDiffusionPipeline
-from PIL import Image
-import torchvision.transforms as transforms
-import numpy as np
 import random
-from transformers.models.clip.image_processing_clip import CLIPImageProcessor
 import os
 
 import argparse
@@ -29,11 +25,10 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 clip_dir = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
 clip_model = CLIPModel.from_pretrained(clip_dir).to(device)
 preprocess = CLIPProcessor.from_pretrained(clip_dir)
-# tokenizer = CLIPTokenizer.from_pretrained(clip_dir)
 
 # Initialize diffusion pipeline and safety checker
-diff_dir = "/data1/zhaoed/models/stable-diffusion-2-1/models--stabilityai--stable-diffusion-2-1/snapshots/5cae40e6a2745ae2b01ad92ae5043f95f23644d6"
-checker_dir = "/data1/zhaoed/models/stable-diffusion-safety-checker/models--CompVis--stable-diffusion-safety-checker/snapshots/cb41f3a270d63d454d385fc2e4f571c487c253c5"
+diff_dir = "stabilityai/stable-diffusion-2-1"
+checker_dir = "CompVis--stable-diffusion-safety-checker"
 diffusion_pipeline = StableDiffusionPipeline.from_pretrained(diff_dir).to(device)
 checker = StableDiffusionSafetyChecker.from_pretrained(checker_dir)
 safety_feature_extractor = AutoFeatureExtractor.from_pretrained(checker_dir)
@@ -143,8 +138,8 @@ def tokenizer_based(k, prompt):
     return k_word_ids
 
 client = OpenAI(
-    base_url="https://api.gptsapi.net/v1",
-    api_key="sk-7gh0c134910ee959aa6cf2d36d027427de0f4719654Tu1yM"
+    base_url="base_url",
+    api_key="api_key"
 )
 
 # Initialize prompt
